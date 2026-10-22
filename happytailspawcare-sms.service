@@ -1,0 +1,16 @@
+[Unit]
+Description=Happy Tails Paw Care SMS bridge (Discord <-> Twilio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nathaniel
+WorkingDirectory=/home/nathaniel/src/discordSMS
+EnvironmentFile=/home/nathaniel/src/discordSMS/.env
+ExecStart=/home/nathaniel/src/discordSMS/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
