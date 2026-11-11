@@ -1,0 +1,10 @@
+[Unit]
+Description=Run leads_to_vcf hourly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

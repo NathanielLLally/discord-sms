@@ -1,0 +1,9 @@
+[Unit]
+Description=Export Warmbly leads to vCards for vdirsyncer
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/nathaniel/src/discordSMS
+# .env uses `export` and ${VAR} expansion, which EnvironmentFile= can't parse
+ExecStart=/bin/bash -c 'set -a; . ./.env; exec .venv/bin/python leads_to_vcf.py'
