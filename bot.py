@@ -16,14 +16,19 @@ import io
 import logging
 import os
 import re
+import uuid
 
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
+from khard.address_book import AnyQuery, VdirAddressBook
+from khard.query import NameQuery
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
+import vobject
 
 import discord
+from discord import app_commands
 
 load_dotenv()
 
@@ -52,13 +57,147 @@ TWILIO_PUBLIC_URL = os.environ.get("TWILIO_PUBLIC_URL", "").strip()
 DISCORD_MAX_LEN = 2000
 SMS_MAX_LEN = 1600  # Twilio hard limit per message
 
-# to:<number>  (case-insensitive). Captures a loose phone string.
-TO_RE = re.compile(r"(?i)\bto:\s*(\+?[\d().\-\s]{6,}\d)")
+KHARD_PATH = os.path.expanduser(
+    os.environ.get("KHARD_CONTACTS_PATH", "~/.contacts/card/")
+)
+
+# to:<phone>  — strict phone match (stops at non-phone char).
+TO_PHONE_RE = re.compile(r"(?i)\bto:\s*(\+?[\d().\-\s]{6,}\d)")
+# to:<name>  multi-word: name delimited by two-or-more spaces ("to:John Smith  hi").
+TO_NAME_MULTI_RE = re.compile(r"(?i)\bto:\s*(.+?)\s{2,}")
+# to:<name>  single word: stops at first whitespace or end-of-string.
+TO_NAME_WORD_RE = re.compile(r"(?i)\bto:\s*(\S+)")
 # E.164 number as emitted by this bot in inbound posts, for reply parsing.
 E164_RE = re.compile(r"\+\d{7,15}")
+# Looks like a phone number (has mostly digits once stripped).
+PHONE_RE = re.compile(r"^[+\d().\-\s]{6,}$")
+
+# Patterns to guess a sender's name from SMS body text.
+_NAME_HINTS: list[re.Pattern] = [
+    re.compile(r"(?i)(?:my name is|this is|it'?s|i'?m|i am)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)"),
+    re.compile(r"(?i)^([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+here\b"),
+    re.compile(r"(?i)^Hi[,!]?\s+(?:I'?m\s+)?([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)"),
+]
+
+CONTACT_CATEGORIES = ["Happy Tails Paw Care", "Added with discord-sms"]
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# Contacts (khard)
+# ---------------------------------------------------------------------------
+class Contacts:
+    """Thin synchronous wrapper around a khard VdirAddressBook."""
+
+    def __init__(self, path: str) -> None:
+        self._ab: VdirAddressBook | None = None
+        self._path = path
+
+    def _book(self) -> VdirAddressBook:
+        if self._ab is None:
+            self._ab = VdirAddressBook("contacts", self._path, skip=True)
+            self._ab.load(AnyQuery())
+        return self._ab
+
+    def reload(self) -> None:
+        self._ab = None
+
+    def lookup_name(self, number: str) -> str | None:
+        """Return the contact's formatted name for a phone number, or None."""
+        normed = normalize_phone(number)
+        if not normed:
+            return None
+        for contact in self._book().contacts.values():
+            for nums in contact.phone_numbers.values():
+                for n in nums:
+                    if normalize_phone(n) == normed:
+                        return contact.formatted_name
+        return None
+
+    def lookup_number(self, name: str) -> list[tuple[str, str]]:
+        """Return [(name, e164), ...] for all contacts matching *name*."""
+        results = []
+        for contact in self._book().search(NameQuery(name)):
+            for nums in contact.phone_numbers.values():
+                for n in nums:
+                    normed = normalize_phone(n)
+                    if normed:
+                        results.append((contact.formatted_name, normed))
+        return results
+
+
+contacts = Contacts(KHARD_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Session-seen unknown numbers
+# ---------------------------------------------------------------------------
+class SeenNumbers:
+    """Track phone numbers seen this session that are not in khard, most-recent first."""
+
+    def __init__(self) -> None:
+        self._order: list[str] = []       # insertion order, most-recent first
+        self._guesses: dict[str, str | None] = {}  # number -> guessed name
+
+    def add(self, number: str, guessed_name: str | None = None) -> None:
+        if number in self._guesses:
+            if guessed_name and not self._guesses[number]:
+                self._guesses[number] = guessed_name
+            return
+        self._guesses[number] = guessed_name
+        self._order.insert(0, number)
+
+    def remove(self, number: str) -> None:
+        self._order = [n for n in self._order if n != number]
+        self._guesses.pop(number, None)
+
+    def all(self) -> list[tuple[str, str | None]]:
+        """Return [(number, guessed_name), ...] most-recent first."""
+        return [(n, self._guesses[n]) for n in self._order]
+
+    def guess(self, number: str) -> str | None:
+        return self._guesses.get(number)
+
+
+seen_numbers = SeenNumbers()
+
+
+# ---------------------------------------------------------------------------
+# Contact creation
+# ---------------------------------------------------------------------------
+def extract_name_from_text(text: str) -> str | None:
+    for pat in _NAME_HINTS:
+        m = pat.search(text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def create_contact_vcf(name: str, number: str) -> str:
+    """Write a new vCard to KHARD_PATH. Returns the created filename."""
+    uid = str(uuid.uuid4())
+    card = vobject.vCard()
+    card.add("uid").value = uid
+    card.add("fn").value = name
+    n = card.add("n")
+    parts = name.rsplit(None, 1)
+    n.value = vobject.vcard.Name(
+        family=parts[1] if len(parts) == 2 else "",
+        given=parts[0],
+    )
+    tel = card.add("tel")
+    tel.value = number
+    tel.type_param = ["CELL", "VOICE", "pref"]
+    cats = card.add("categories")
+    cats.value = CONTACT_CATEGORIES
+    card.add("note").value = "Happy Tails Paw Care Discord Bot"
+
+    filename = f"{uid}.vcf"
+    with open(os.path.join(KHARD_PATH, filename), "w") as fh:
+        fh.write(card.serialize())
+    return filename
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +222,46 @@ def normalize_phone(raw: str | None) -> str | None:
 
 
 def extract_to_and_body(text: str) -> tuple[str | None, str]:
-    """Pull a `to:<number>` token out of text; return (number, remaining)."""
-    m = TO_RE.search(text)
-    if not m:
+    """Pull a `to:<target>` token out of text; return (raw_target, remaining body).
+
+    Resolution order:
+      1. Phone number  — `to:917-555-1234 body`
+      2. Multi-word name delimited by two spaces — `to:John Smith  body`
+      3. Single-word name — `to:Chrissa body`
+    """
+    for pattern in (TO_PHONE_RE, TO_NAME_MULTI_RE, TO_NAME_WORD_RE):
+        m = pattern.search(text)
+        if m:
+            break
+    else:
         return None, text
-    number = normalize_phone(m.group(1))
+    target = m.group(1).strip()
     before, after = text[: m.start()].rstrip(), text[m.end():].lstrip()
     body = (before + (" " if before and after else "") + after).strip()
-    return number, body
+    return target, body
+
+
+def resolve_to(target: str) -> tuple[str | None, str | None]:
+    """Resolve a to: target to (e164, display_name).
+
+    If *target* looks like a phone number it is normalised directly.
+    Otherwise khard is searched by name; a unique match is returned,
+    multiple matches return (None, None) so the caller can ask the user
+    to be more specific.
+    """
+    if PHONE_RE.match(target):
+        number = normalize_phone(target)
+        name = contacts.lookup_name(number) if number else None
+        return number, name
+
+    # Name lookup
+    matches = contacts.lookup_number(target)
+    if len(matches) == 1:
+        return matches[0][1], matches[0][0]
+    if len(matches) > 1:
+        log.info("Ambiguous to: %r — %d matches", target, len(matches))
+        return None, None  # caller will react with ❓ and log
+    return None, None
 
 
 def phone_from_reference(content: str) -> str | None:
@@ -116,6 +287,102 @@ class Bridge(discord.Client):
         super().__init__(intents=intents)
         self.channel: discord.TextChannel | None = None
         self.web_runner: web.AppRunner | None = None
+        self.tree = app_commands.CommandTree(self)
+        # Temporarily hosted media: token -> (bytes, content_type)
+        self._media_cache: dict[str, tuple[bytes, str]] = {}
+        self._register_commands()
+
+    def _register_commands(self) -> None:
+        @self.tree.command(name="sms", description="Send an SMS to a contact or number")
+        @app_commands.describe(
+            to="Contact name or phone number",
+            message="Message body",
+            attachment="Optional file or image to send as MMS",
+        )
+        async def sms_command(
+            interaction: discord.Interaction,
+            to: str,
+            message: str = "",
+            attachment: discord.Attachment | None = None,
+        ) -> None:
+            if not self._is_admin_interaction(interaction):
+                await interaction.response.send_message("Not authorized.", ephemeral=True)
+                return
+            if not message and not attachment:
+                await interaction.response.send_message(
+                    "Provide a message body, an attachment, or both.", ephemeral=True
+                )
+                return
+            to_number, contact_name = await asyncio.to_thread(resolve_to, to)
+            if not to_number:
+                await interaction.response.send_message(
+                    f"Could not resolve **{to}** to a phone number.", ephemeral=True
+                )
+                return
+            label = f"{contact_name} ({to_number})" if contact_name else to_number
+            media_urls = await self._stage_discord_attachments([attachment]) if attachment else []
+            try:
+                await self._send_sms(to_number, message, media_urls or None)
+                envelope = f"\U0001f4e4 **SMS to {label}**"
+                if message:
+                    envelope += f"\n{message}"
+                if attachment:
+                    envelope += f"\n📎 {attachment.filename}"
+                await interaction.response.send_message(envelope)
+            except Exception:
+                log.exception("Twilio send failed via /sms to %s", label)
+                await interaction.response.send_message(f"❌ Failed to send to {label}", ephemeral=True)
+
+        @sms_command.autocomplete("to")
+        async def sms_to_autocomplete(
+            interaction: discord.Interaction,
+            current: str,
+        ) -> list[app_commands.Choice[str]]:
+            if not current:
+                return []
+            try:
+                matches = await asyncio.to_thread(contacts.lookup_number, current)
+            except Exception:
+                return []
+            return [
+                app_commands.Choice(name=f"{name} ({number})", value=number)
+                for name, number in matches[:25]
+            ]
+
+        # /add /new /create — identical commands registered via decorator pattern.
+        for _cmd_name in ("add", "new", "create"):
+
+            @self.tree.command(name=_cmd_name, description="Add an unknown number as a new khard contact")
+            @app_commands.describe(number="Phone number (E.164)", name="Contact name")
+            async def _add_cmd(
+                interaction: discord.Interaction,
+                number: str,
+                name: str,
+            ) -> None:
+                await self._add_contact_command(interaction, number, name)
+
+            @_add_cmd.autocomplete("number")
+            async def _add_number_ac(
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                choices = []
+                for num, guess in seen_numbers.all():
+                    label = f"{guess} ({num})" if guess else num
+                    if not current or current.lower() in label.lower():
+                        choices.append(app_commands.Choice(name=label, value=num))
+                return choices[:25]
+
+            @_add_cmd.autocomplete("name")
+            async def _add_name_ac(
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                number_val = interaction.namespace.number or ""
+                guess = seen_numbers.guess(number_val)
+                if guess and (not current or current.lower() in guess.lower()):
+                    return [app_commands.Choice(name=guess, value=guess)]
+                return []
 
     async def setup_hook(self) -> None:
         # Start the Twilio webhook receiver inside the bot's event loop.
@@ -123,11 +390,14 @@ class Bridge(discord.Client):
         app.router.add_post("/sms", self.handle_twilio)
         app.router.add_post("/", self.handle_twilio)
         app.router.add_get("/health", lambda r: web.Response(text="ok"))
+        app.router.add_get("/media/{token}", self.serve_media)
         self.web_runner = web.AppRunner(app)
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, "127.0.0.1", DISCORD_WEBHOOK_PORT)
         await site.start()
         log.info("Twilio webhook listening on 127.0.0.1:%d", DISCORD_WEBHOOK_PORT)
+        await self.tree.sync()
+        log.info("Slash commands synced")
 
     async def on_ready(self) -> None:
         self.channel = self.get_channel(DISCORD_CHANNEL_ID) or await self.fetch_channel(
@@ -145,18 +415,41 @@ class Bridge(discord.Client):
     async def handle_twilio(self, request: web.Request) -> web.Response:
         form = await request.post()
 
+        # Reconstruct the public URL Twilio signed: prefer explicit config,
+        # fall back to X-Forwarded-Proto + Host headers set by nginx.
         if TWILIO_PUBLIC_URL:
-            url = TWILIO_PUBLIC_URL.rstrip("/") + request.path
-            signature = request.headers.get("X-Twilio-Signature", "")
-            if not twilio_validator.validate(url, dict(form), signature):
-                log.warning("Rejected Twilio request with bad signature")
-                return web.Response(status=403, text="invalid signature")
+            public_url = TWILIO_PUBLIC_URL.rstrip("/") + request.path
+        else:
+            proto = request.headers.get("X-Forwarded-Proto", "https")
+            host = request.headers.get("Host", "")
+            public_url = f"{proto}://{host}{request.path}" if host else ""
 
-        sender = form.get("From", "unknown")
+        if not public_url:
+            log.warning("Cannot validate signature: no public URL determinable")
+            return web.Response(status=400, text="misconfigured webhook")
+
+        signature = request.headers.get("X-Twilio-Signature", "")
+        if not twilio_validator.validate(public_url, dict(form), signature):
+            log.warning("Rejected Twilio request with bad signature for %s", public_url)
+            return web.Response(status=403, text="invalid signature")
+
+        sender = form.get("From", "")
         body = (form.get("Body") or "").strip()
         num_media = int(form.get("NumMedia", "0") or "0")
 
-        header = f"\U0001f4e9 **SMS from {sender}**"
+        display = await asyncio.to_thread(contacts.lookup_name, sender) if sender else None
+        if sender and not display:
+            guessed = extract_name_from_text(body)
+            seen_numbers.add(sender, guessed)
+            unknown_hint = "  *(unknown — /add to save)*"
+        else:
+            unknown_hint = ""
+        sender_label = f"{display} ({sender})" if display else sender
+        header = (
+            f"\U0001f4e9 **SMS from {sender_label}**{unknown_hint}"
+            if sender_label
+            else "\U0001f4e9 **SMS**"
+        )
         text = header + (f"\n{body}" if body else "")
 
         files: list[discord.File] = []
@@ -179,6 +472,44 @@ class Bridge(discord.Client):
             log.exception("Failed to post inbound SMS to Discord")
 
         return self._twiml()
+
+    async def serve_media(self, request: web.Request) -> web.Response:
+        """One-shot endpoint: serve a staged Discord attachment to Twilio then evict it."""
+        token = request.match_info["token"]
+        entry = self._media_cache.pop(token, None)
+        if entry is None:
+            return web.Response(status=404)
+        data, ctype = entry
+        return web.Response(body=data, content_type=ctype)
+
+    async def _stage_discord_attachments(
+        self, attachments: list[discord.Attachment]
+    ) -> list[str]:
+        """Download Discord attachments and stage them on our own server.
+
+        Returns a list of public URLs Twilio can fetch (via nginx).
+        Discord CDN URLs use signed expiring params; serving through our own
+        endpoint avoids any access issues.
+        """
+        if not TWILIO_PUBLIC_URL:
+            # Fall back to raw Discord URLs if we have no public base URL.
+            return [a.url for a in attachments]
+
+        base = TWILIO_PUBLIC_URL.rstrip("/")
+        urls: list[str] = []
+        async with aiohttp.ClientSession() as session:
+            for attachment in attachments:
+                try:
+                    async with session.get(attachment.url) as resp:
+                        resp.raise_for_status()
+                        data = await resp.read()
+                        ctype = resp.content_type or "application/octet-stream"
+                    token = uuid.uuid4().hex
+                    self._media_cache[token] = (data, ctype)
+                    urls.append(f"{base}/media/{token}")
+                except Exception:
+                    log.exception("Failed to stage attachment %s", attachment.url)
+        return urls
 
     async def _download_media(self, form, num_media: int) -> list[discord.File]:
         """Fetch MMS media (auth-protected) and wrap as Discord attachments."""
@@ -211,40 +542,125 @@ class Bridge(discord.Client):
 
     # ---- Outbound: Discord -> Twilio -----------------------------------
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.author.id == self.user.id:
-            return
         if message.channel.id != DISCORD_CHANNEL_ID:
+            return
+
+        attachments = f" [{len(message.attachments)} attachment(s)]" if message.attachments else ""
+        log.info("[#channel] %s: %s%s", message.author, message.content or "<no text>", attachments)
+
+        if message.author.bot or message.author.id == self.user.id:
             return
         if not self._is_admin(message):
             return
 
         content = (message.content or "").strip()
-        to_number, body = extract_to_and_body(content)
+        to_target, body = extract_to_and_body(content)
 
-        # No explicit to: -> resolve recipient from the replied-to message.
-        if to_number is None and message.reference is not None:
+        to_number: str | None = None
+        contact_name: str | None = None
+
+        if to_target is not None:
+            if not PHONE_RE.match(to_target):
+                # Name lookup — check for ambiguity before resolve_to discards the list.
+                matches = await asyncio.to_thread(contacts.lookup_number, to_target)
+                if len(matches) > 1:
+                    await self._post_contact_choices(message, to_target, matches)
+                    return
+
+            to_number, contact_name = await asyncio.to_thread(resolve_to, to_target)
+        elif message.reference is not None:
+            # No explicit to: — resolve recipient from the replied-to message.
             try:
                 ref = message.reference.resolved or await message.channel.fetch_message(
                     message.reference.message_id
                 )
                 to_number = phone_from_reference(ref.content)
-                body = content  # reply text is the whole outgoing body
+                if to_number:
+                    contact_name = await asyncio.to_thread(contacts.lookup_name, to_number)
+                body = content
             except Exception:
                 log.exception("Could not resolve replied-to message")
 
+        media_urls = (
+            await self._stage_discord_attachments(message.attachments)
+            if message.attachments
+            else []
+        )
+
         if not to_number:
-            await message.add_reaction("❓")  # ❓ cannot determine recipient
+            await message.add_reaction("❓")
             return
-        if not body:
-            await message.add_reaction("⚠️")  # ⚠️ empty body
+        if not body and not media_urls:
+            await message.add_reaction("⚠️")
             return
 
+        label = f"{contact_name} ({to_number})" if contact_name else to_number
+        log.info("Sending SMS to %s%s", label, f" + {len(media_urls)} media" if media_urls else "")
+
         try:
-            await self._send_sms(to_number, body)
-            await message.add_reaction("✅")  # ✅
+            await self._send_sms(to_number, body, media_urls)
+            await message.add_reaction("✅")
         except Exception:
-            log.exception("Twilio send failed")
-            await message.add_reaction("❌")  # ❌
+            log.exception("Twilio send failed to %s", label)
+            await message.add_reaction("❌")
+
+    async def _add_contact_command(
+        self,
+        interaction: discord.Interaction,
+        number: str,
+        name: str,
+    ) -> None:
+        if not self._is_admin_interaction(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        normed = normalize_phone(number)
+        if not normed:
+            await interaction.response.send_message(
+                f"Could not parse **{number}** as a phone number.", ephemeral=True
+            )
+            return
+        existing = await asyncio.to_thread(contacts.lookup_name, normed)
+        if existing:
+            await interaction.response.send_message(
+                f"**{normed}** is already saved as **{existing}**.", ephemeral=True
+            )
+            return
+        try:
+            filename = await asyncio.to_thread(create_contact_vcf, name, normed)
+            contacts.reload()
+            seen_numbers.remove(normed)
+            log.info("Created contact %s (%s) → %s", name, normed, filename)
+            await interaction.response.send_message(
+                f"✅ Saved **{name}** ({normed}) to contacts."
+            )
+        except Exception:
+            log.exception("Failed to create contact %s %s", name, normed)
+            await interaction.response.send_message(
+                f"❌ Failed to save contact.", ephemeral=True
+            )
+
+    async def _post_contact_choices(
+        self,
+        trigger: discord.Message,
+        query: str,
+        matches: list[tuple[str, str]],
+    ) -> None:
+        """Post one line per ambiguous match; user replies to one to send SMS."""
+        await trigger.reply(
+            f"Multiple contacts match **{query}** — reply to one to send:",
+            mention_author=False,
+        )
+        for name, number in matches:
+            await self.channel.send(f"\U0001f4cb **{name}** {number}")
+
+    def _is_admin_interaction(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return False
+        return any(
+            role.name == DISCORD_ADMIN_ROLE or str(role.id) == DISCORD_ADMIN_ROLE
+            for role in member.roles
+        )
 
     def _is_admin(self, message: discord.Message) -> bool:
         member = message.author
@@ -255,15 +671,27 @@ class Bridge(discord.Client):
             for role in member.roles
         )
 
-    async def _send_sms(self, to_number: str, body: str) -> None:
-        for part in chunk(body, SMS_MAX_LEN):
-            await asyncio.to_thread(
-                twilio_client.messages.create,
-                to=to_number,
-                from_=TWILIO_PHONE_NUMBER,
-                body=part,
-            )
-        log.info("Sent SMS to %s (%d chars)", to_number, len(body))
+    async def _send_sms(
+        self,
+        to_number: str,
+        body: str,
+        media_urls: list[str] | None = None,
+    ) -> None:
+        parts = chunk(body, SMS_MAX_LEN) if body else [None]
+        for i, part in enumerate(parts):
+            urls = media_urls if i == 0 else None
+            kwargs: dict = {"to": to_number, "from_": TWILIO_PHONE_NUMBER}
+            if part:
+                kwargs["body"] = part
+            if urls:
+                kwargs["media_url"] = urls
+            await asyncio.to_thread(twilio_client.messages.create, **kwargs)
+        log.info(
+            "Sent to %s: %d chars%s",
+            to_number,
+            len(body),
+            f" + {len(media_urls)} media" if media_urls else "",
+        )
 
 
 def main() -> None:

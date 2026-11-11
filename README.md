@@ -7,14 +7,86 @@ A Discord ↔ Twilio SMS/MMS bridge.
 - **Outbound** — any message posted in that channel by a user holding the
   `DISCORD_ADMIN_ROLE` is sent out as an SMS via the Twilio REST API.
 
-## Setup
+## Installation
+
+### 1. Clone and create the venv
 
 ```bash
-# deps are installed into the project venv
-.venv/bin/pip install "discord.py>=2.4" twilio aiohttp python-dotenv
+git clone https://github.com/NathanielLLally/discord-sms.git
+cd discord-sms
+python3 -m venv .venv
+.venv/bin/pip install "discord.py>=2.4" twilio aiohttp python-dotenv vdirsyncer
+```
 
-# configure (see .env)
-./run.sh                      # or: .venv/bin/python bot.py
+### 2. Configure `.env`
+
+Copy the template and fill in your values:
+
+```bash
+cp .env.example .env   # or edit .env directly
+```
+
+### 3. Discord bot setup
+
+In the [Discord Developer Portal](https://discord.com/developers/applications):
+
+- Enable the **Message Content** and **Server Members** privileged intents.
+- Invite the bot to your server with `bot` scope and **Send Messages** /
+  **Read Message History** / **Add Reactions** permissions.
+
+### 4. SMS bridge — `happytailspawcare-sms` (system service)
+
+The bot runs as a system service. On Rocky Linux / RHEL the `.venv` lives under
+`$HOME` which is labeled `user_home_t` by SELinux — relabel the venv binaries
+so the system service can execute them:
+
+```bash
+sudo semanage fcontext -a -t bin_t \
+  '/home/nathaniel/src/discordSMS/.venv/bin(/.*)?'
+sudo restorecon -Rv /home/nathaniel/src/discordSMS/.venv/bin/
+```
+
+Then install and start the service:
+
+```bash
+sudo cp happytailspawcare-sms.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now happytailspawcare-sms
+```
+
+### 5. vdirsyncer (user service, runs every minute)
+
+Because the venv is in `$HOME`, run vdirsyncer as a **user** service to avoid
+SELinux `user_home_t` execution denials:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp vdirsyncer.service vdirsyncer.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now vdirsyncer.timer
+```
+
+Enable lingering so the timer keeps running after logout:
+
+```bash
+sudo loginctl enable-linger nathaniel
+```
+
+### 6. nginx reverse proxy
+
+Copy and adapt `nginx.conf.example`, then point the Twilio number's
+"A message comes in" webhook at `https://<host>/sms`.
+
+```bash
+sudo cp nginx.conf.example /etc/nginx/conf.d/discord-sms.conf
+# edit the file to set your domain / cert paths
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Running manually
+
+```bash
+./run.sh    # or: .venv/bin/python bot.py
 ```
 
 ### Required environment (`.env`)

@@ -1,0 +1,7 @@
+[Unit]
+Description=vdirsyncer sync
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/nathaniel/src/discordSMS/.venv/bin/vdirsyncer sync
