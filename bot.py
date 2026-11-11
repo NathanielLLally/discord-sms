@@ -71,6 +71,11 @@ TO_NAME_WORD_RE = re.compile(r"(?i)\bto:\s*(\S+)")
 E164_RE = re.compile(r"\+\d{7,15}")
 # Looks like a phone number (has mostly digits once stripped).
 PHONE_RE = re.compile(r"^[+\d().\-\s]{6,}$")
+# Call notification relayed by the twilio-func-forward-notify.js Function:
+#   "Incoming call from +11234567890 (CITY, STATE)"  — location optional.
+INCOMING_CALL_RE = re.compile(
+    r"^Incoming call from\s+(\S+)(?:\s*\(([^)]*)\))?\s*$", re.IGNORECASE
+)
 
 # Patterns to guess a sender's name from SMS body text.
 _NAME_HINTS: list[re.Pattern] = [
@@ -104,8 +109,8 @@ class Contacts:
     def reload(self) -> None:
         self._ab = None
 
-    def lookup_name(self, number: str) -> str | None:
-        """Return the contact's formatted name for a phone number, or None."""
+    def lookup(self, number: str) -> tuple[str, list[str]] | None:
+        """Return (formatted_name, [emails]) for a phone number, or None."""
         normed = normalize_phone(number)
         if not normed:
             return None
@@ -113,8 +118,14 @@ class Contacts:
             for nums in contact.phone_numbers.values():
                 for n in nums:
                     if normalize_phone(n) == normed:
-                        return contact.formatted_name
+                        emails = [e for es in contact.emails.values() for e in es]
+                        return contact.formatted_name, list(dict.fromkeys(emails))
         return None
+
+    def lookup_name(self, number: str) -> str | None:
+        """Return the contact's formatted name for a phone number, or None."""
+        found = self.lookup(number)
+        return found[0] if found else None
 
     def lookup_number(self, name: str) -> list[tuple[str, str]]:
         """Return [(name, e164), ...] for all contacts matching *name*."""
@@ -437,6 +448,11 @@ class Bridge(discord.Client):
         body = (form.get("Body") or "").strip()
         num_media = int(form.get("NumMedia", "0") or "0")
 
+        call = INCOMING_CALL_RE.match(body)
+        if call:
+            await self._post_incoming_call(call.group(1), call.group(2))
+            return self._twiml()
+
         display = await asyncio.to_thread(contacts.lookup_name, sender) if sender else None
         if sender and not display:
             guessed = extract_name_from_text(body)
@@ -472,6 +488,38 @@ class Bridge(discord.Client):
             log.exception("Failed to post inbound SMS to Discord")
 
         return self._twiml()
+
+    async def _post_incoming_call(self, raw_caller: str, location: str | None) -> None:
+        """Post a call notification, enriched with khard name/email when known."""
+        caller = normalize_phone(raw_caller) or raw_caller
+        found = await asyncio.to_thread(contacts.lookup, caller) if caller else None
+        location = (location or "").strip()
+
+        if found:
+            name, emails = found
+            header = f"\U0001f4de **Incoming call from {name} ({caller})**"
+        else:
+            name, emails = None, []
+            if PHONE_RE.match(caller):
+                seen_numbers.add(caller)
+                header = f"\U0001f4de **Incoming call from {caller}**  *(unknown — /add to save)*"
+            else:  # e.g. "Anonymous" / "Unknown"
+                header = f"\U0001f4de **Incoming call from {caller}**"
+
+        lines = [header]
+        if location:
+            lines.append(f"\U0001f4cd {location}")
+        if emails:
+            lines.append("✉️ " + ", ".join(emails))
+        log.info("Incoming call from %s%s", f"{name} " if name else "", caller)
+
+        if self.channel is None:
+            log.error("Channel not ready; dropping call notification from %s", caller)
+            return
+        try:
+            await self.channel.send("\n".join(lines))
+        except Exception:
+            log.exception("Failed to post call notification to Discord")
 
     async def serve_media(self, request: web.Request) -> web.Response:
         """One-shot endpoint: serve a staged Discord attachment to Twilio then evict it."""
