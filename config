@@ -11,21 +11,31 @@
 # A folder where vdirsyncer can store some metadata about each pair.
 status_path = "~/.vdirsyncer/status/"
 
+[pair google_contacts]
+# A `[pair <name>]` block defines two storages `a` and `b` that should be
+# synchronized. The definition of these storages follows in `[storage <name>]`
+# blocks. This is similar to accounts in OfflineIMAP.
+a = "google_contacts_local"
+b = "google_contacts_remote"
+collections = ["from b"]
+conflict_resolution = "b wins"
+
 # CARDDAV
 [pair icloud_contacts]
 # A `[pair <name>]` block defines two storages `a` and `b` that should be
 # synchronized. The definition of these storages follows in `[storage <name>]`
 # blocks. This is similar to accounts in OfflineIMAP.
-a = "contacts_local"
-b = "contacts_remote"
+a = "icloud_contacts_local"
+b = "icloud_contacts_remote"
 
 # Synchronize all collections that can be found.
 # You need to run `vdirsyncer discover` if new calendars/addressbooks are added
 # on the server.
-#collections = [["contacts", "contacts"]]
-collections = ["from a", "from b"]
+#collections = [["icloud_contacts", "icloud_contacts"]]
+#collections = ["from a", "from b"]
+collections = ["card"]
 
-# Synchronize the "display name" property into a local file (~/.contacts/displayname).
+# Synchronize the "display name" property into a local file (~/.icloud_contacts/displayname).
 metadata = ["displayname"]
 
 # To resolve a conflict the following values are possible:
@@ -34,14 +44,14 @@ metadata = ["displayname"]
 #   `"b wins"` - assume b's items to be more up-to-date
 #conflict_resolution = null
 
-[storage contacts_local]
+[storage icloud_contacts_local]
 # A storage references actual data on a remote server or on the local disk.
 # Similar to repositories in OfflineIMAP.
 type = "filesystem"
-path = "~/.contacts/"
+path = "~/.contacts/icloud"
 fileext = ".vcf"
 
-[storage contacts_remote]
+[storage icloud_contacts_remote]
 type = "carddav"
 url = "https://contacts.icloud.com/"
 username.fetch = ["command", "printenv", "APPLE_CONTACTS_USER"]
@@ -50,4 +60,19 @@ username.fetch = ["command", "printenv", "APPLE_CONTACTS_USER"]
 #password = "xnfl-iiem-wcwu-kytu"
 password.fetch = ["command", "printenv", "APPLE_CONTACTS_PASS"]
 
+
+[storage google_contacts_local]
+# A storage references actual data on a remote server or on the local disk.
+# Similar to repositories in OfflineIMAP.
+type = "filesystem"
+path = "~/.contacts/google"
+fileext = ".vcf"
+
+[storage google_contacts_remote]
+type = "google_contacts"
+token_file = "~/.vdirsyncer/google_token"
+client_id = "YOUR_CLIENT_ID"
+client_id.fetch = ["command", "printenv", "GOOGLE_CONTACTS_CLIENTID"]
+client_secret = "YOUR_CLIENT_SECRET"
+client_secret.fetch = ["command", "printenv", "GOOGLE_CONTACTS_SECRET"]
 
