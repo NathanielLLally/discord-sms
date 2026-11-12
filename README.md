@@ -72,6 +72,15 @@ Enable lingering so the timer keeps running after logout:
 sudo loginctl enable-linger nathaniel
 ```
 
+`leads_to_vcf.py` exports Warmbly leads into the same collection hourly. It
+reads `LEADS_DB_URL` and `WARMBLY_BIN` from `.env`:
+
+```bash
+cp leads-to-vcf.service leads-to-vcf.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now leads-to-vcf.timer
+```
+
 ### 6. nginx reverse proxy
 
 Copy and adapt `nginx.conf.example`, then point the Twilio number's

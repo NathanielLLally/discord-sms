@@ -108,11 +108,26 @@ class Contacts:
     def __init__(self, path: str) -> None:
         self._ab: VdirAddressBook | None = None
         self._path = path
+        self._sig: frozenset | None = None
+
+    def _signature(self) -> frozenset:
+        """(name, mtime, size) of every .vcf, so external edits (khard, vdirsyncer) are noticed."""
+        try:
+            with os.scandir(os.path.expanduser(self._path)) as it:
+                return frozenset(
+                    (e.name, st.st_mtime_ns, st.st_size)
+                    for e in it
+                    if e.name.endswith(".vcf") and (st := e.stat())
+                )
+        except OSError:
+            return frozenset()
 
     def _book(self) -> VdirAddressBook:
-        if self._ab is None:
-            self._ab = VdirAddressBook("contacts", self._path, skip=True)
-            self._ab.load(AnyQuery())
+        sig = self._signature()
+        if self._ab is None or sig != self._sig:
+            ab = VdirAddressBook("contacts", self._path, skip=True)
+            ab.load(AnyQuery())
+            self._ab, self._sig = ab, sig
         return self._ab
 
     def reload(self) -> None:

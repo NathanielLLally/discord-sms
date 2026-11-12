@@ -116,9 +116,11 @@ def build_group(member_uids: list) -> vobject.vCard:
 
 def write_if_changed(path: Path, text: str) -> bool:
     # Rewriting identical cards would make vdirsyncer re-upload them
-    if path.exists() and path.read_text() == text:
+    # Compare bytes: read_text() would translate vobject's CRLF and never match
+    data = text.encode()
+    if path.exists() and path.read_bytes() == data:
         return False
-    path.write_text(text)
+    path.write_bytes(data)
     return True
 
 
