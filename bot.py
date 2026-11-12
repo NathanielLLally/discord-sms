@@ -13,9 +13,12 @@ The outbound recipient ("To") is resolved from either:
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
+import sys
+import syslog
 import uuid
 
 import aiohttp
@@ -53,6 +56,12 @@ TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
 # Optional: the public https URL nginx forwards to this service. When set,
 # inbound Twilio requests are verified against the X-Twilio-Signature header.
 TWILIO_PUBLIC_URL = os.environ.get("TWILIO_PUBLIC_URL", "").strip()
+
+# Second listener for Twilio call status callbacks (StatusCallback URL).
+TWILIO_STATUS_PORT = int(os.environ.get("TWILIO_STATUS_PORT", "2325"))
+TWILIO_STATUS_PUBLIC_URL = os.environ.get(
+    "TWILIO_STATUS_PUBLIC_URL", "https://status.twilio.happytailspawcare.com"
+).strip()
 
 DISCORD_MAX_LEN = 2000
 SMS_MAX_LEN = 1600  # Twilio hard limit per message
@@ -298,6 +307,7 @@ class Bridge(discord.Client):
         super().__init__(intents=intents)
         self.channel: discord.TextChannel | None = None
         self.web_runner: web.AppRunner | None = None
+        self.status_runner: web.AppRunner | None = None
         self.tree = app_commands.CommandTree(self)
         # Temporarily hosted media: token -> (bytes, content_type)
         self._media_cache: dict[str, tuple[bytes, str]] = {}
@@ -407,6 +417,16 @@ class Bridge(discord.Client):
         site = web.TCPSite(self.web_runner, "127.0.0.1", DISCORD_WEBHOOK_PORT)
         await site.start()
         log.info("Twilio webhook listening on 127.0.0.1:%d", DISCORD_WEBHOOK_PORT)
+
+        # Separate receiver for Twilio call status callbacks.
+        status_app = web.Application()
+        status_app.router.add_get("/health", lambda r: web.Response(text="ok"))
+        status_app.router.add_post("/{tail:.*}", self.handle_call_status)
+        self.status_runner = web.AppRunner(status_app)
+        await self.status_runner.setup()
+        status_site = web.TCPSite(self.status_runner, "127.0.0.1", TWILIO_STATUS_PORT)
+        await status_site.start()
+        log.info("Twilio call-status webhook listening on 127.0.0.1:%d", TWILIO_STATUS_PORT)
         await self.tree.sync()
         log.info("Slash commands synced")
 
@@ -420,20 +440,24 @@ class Bridge(discord.Client):
     async def close(self) -> None:
         if self.web_runner:
             await self.web_runner.cleanup()
+        if self.status_runner:
+            await self.status_runner.cleanup()
         await super().close()
 
     # ---- Inbound: Twilio -> Discord ------------------------------------
-    async def handle_twilio(self, request: web.Request) -> web.Response:
-        form = await request.post()
-
+    @staticmethod
+    def _check_signature(
+        request: web.Request, form, base_url: str
+    ) -> web.Response | None:
+        """Verify X-Twilio-Signature. Returns an error response, or None if OK."""
         # Reconstruct the public URL Twilio signed: prefer explicit config,
         # fall back to X-Forwarded-Proto + Host headers set by nginx.
-        if TWILIO_PUBLIC_URL:
-            public_url = TWILIO_PUBLIC_URL.rstrip("/") + request.path
+        if base_url:
+            public_url = base_url.rstrip("/") + request.path_qs
         else:
             proto = request.headers.get("X-Forwarded-Proto", "https")
             host = request.headers.get("Host", "")
-            public_url = f"{proto}://{host}{request.path}" if host else ""
+            public_url = f"{proto}://{host}{request.path_qs}" if host else ""
 
         if not public_url:
             log.warning("Cannot validate signature: no public URL determinable")
@@ -443,6 +467,24 @@ class Bridge(discord.Client):
         if not twilio_validator.validate(public_url, dict(form), signature):
             log.warning("Rejected Twilio request with bad signature for %s", public_url)
             return web.Response(status=403, text="invalid signature")
+        return None
+
+    # ---- Twilio call status callbacks ------------------------------------
+    async def handle_call_status(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        if (err := self._check_signature(request, form, TWILIO_STATUS_PUBLIC_URL)):
+            return err
+
+        data = {k: form.getone(k) for k in form.keys()}
+        # Console: pretty-printed like `| jq`. Syslog: one compact line.
+        print(json.dumps(data, indent=2, sort_keys=True), file=sys.stdout, flush=True)
+        syslog.syslog(syslog.LOG_INFO, json.dumps(data, sort_keys=True, separators=(",", ":")))
+        return web.Response(status=204)
+
+    async def handle_twilio(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        if (err := self._check_signature(request, form, TWILIO_PUBLIC_URL)):
+            return err
 
         sender = form.get("From", "")
         body = (form.get("Body") or "").strip()
@@ -743,6 +785,7 @@ class Bridge(discord.Client):
 
 
 def main() -> None:
+    syslog.openlog("discord-sms-callstatus", syslog.LOG_PID, syslog.LOG_USER)
     Bridge().run(DISCORD_TOKEN, log_handler=None)
 
 

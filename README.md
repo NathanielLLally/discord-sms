@@ -101,6 +101,8 @@ sudo nginx -t && sudo systemctl reload nginx
 | `TWILIO_AUTH_TOKEN`    | Twilio auth token.                                           |
 | `TWILIO_PHONE_NUMBER`  | The Twilio number outbound SMS is sent **from** (E.164).      |
 | `TWILIO_PUBLIC_URL`    | *(optional)* public https URL; enables signature validation. |
+| `TWILIO_STATUS_PORT`   | *(optional)* local port for call-status callbacks (default `2325`). |
+| `TWILIO_STATUS_PUBLIC_URL` | *(optional)* public URL Twilio signs status callbacks against (default `https://status.twilio.happytailspawcare.com`). |
 
 The bot requires the **Message Content** and **Server Members** privileged
 intents (enable them in the Discord Developer Portal).
@@ -135,4 +137,20 @@ See `discord-sms.service` (systemd). Install with:
 ```bash
 sudo cp discord-sms.service /etc/systemd/system/
 sudo systemctl enable --now discord-sms
+```
+
+## Call status callbacks
+
+A second receiver listens on `127.0.0.1:$TWILIO_STATUS_PORT` (default `2325`)
+and accepts `POST` on any path. nginx serves it as
+`https://status.twilio.happytailspawcare.com/` (see `nginx.conf.example`);
+use that as the call's **StatusCallback** URL.
+
+Each report has its `X-Twilio-Signature` checked against
+`TWILIO_STATUS_PUBLIC_URL`. It is then printed to stdout as pretty JSON
+(like `| jq`) and written to syslog as one compact JSON line, tagged
+`discord-sms-callstatus`:
+
+```bash
+journalctl -t discord-sms-callstatus -f
 ```
