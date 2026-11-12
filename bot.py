@@ -12,6 +12,8 @@ The outbound recipient ("To") is resolved from either:
 """
 
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -62,6 +64,13 @@ TWILIO_STATUS_PORT = int(os.environ.get("TWILIO_STATUS_PORT", "2325"))
 TWILIO_STATUS_PUBLIC_URL = os.environ.get(
     "TWILIO_STATUS_PUBLIC_URL", "https://status.twilio.happytailspawcare.com"
 ).strip()
+
+# Third listener for Vapi server/status webhooks, authenticated with a Vapi
+# "HMAC" credential (Dashboard -> Credentials). Defaults match Vapi's defaults.
+VAPI_HMAC_PSK = os.environ.get("VAPI_HMAC_PSK", "").strip()
+VAPI_STATUS_PORT = int(os.environ.get("VAPI_STATUS_PORT", "2326"))
+VAPI_HMAC_SIGNATURE_HEADER = os.environ.get("VAPI_HMAC_SIGNATURE_HEADER", "x-signature")
+VAPI_HMAC_TIMESTAMP_HEADER = os.environ.get("VAPI_HMAC_TIMESTAMP_HEADER", "x-timestamp")
 
 DISCORD_MAX_LEN = 2000
 SMS_MAX_LEN = 1600  # Twilio hard limit per message
@@ -323,6 +332,7 @@ class Bridge(discord.Client):
         self.channel: discord.TextChannel | None = None
         self.web_runner: web.AppRunner | None = None
         self.status_runner: web.AppRunner | None = None
+        self.vapi_runner: web.AppRunner | None = None
         self.tree = app_commands.CommandTree(self)
         # Temporarily hosted media: token -> (bytes, content_type)
         self._media_cache: dict[str, tuple[bytes, str]] = {}
@@ -442,6 +452,18 @@ class Bridge(discord.Client):
         status_site = web.TCPSite(self.status_runner, "127.0.0.1", TWILIO_STATUS_PORT)
         await status_site.start()
         log.info("Twilio call-status webhook listening on 127.0.0.1:%d", TWILIO_STATUS_PORT)
+
+        # Separate receiver for Vapi status/server messages.
+        vapi_app = web.Application()
+        vapi_app.router.add_get("/health", lambda r: web.Response(text="ok"))
+        vapi_app.router.add_post("/{tail:.*}", self.handle_vapi_status)
+        self.vapi_runner = web.AppRunner(vapi_app)
+        await self.vapi_runner.setup()
+        vapi_site = web.TCPSite(self.vapi_runner, "127.0.0.1", VAPI_STATUS_PORT)
+        await vapi_site.start()
+        log.info("Vapi status webhook listening on 127.0.0.1:%d", VAPI_STATUS_PORT)
+        if not VAPI_HMAC_PSK:
+            log.warning("VAPI_HMAC_PSK unset: Vapi webhooks will be rejected")
         await self.tree.sync()
         log.info("Slash commands synced")
 
@@ -457,6 +479,8 @@ class Bridge(discord.Client):
             await self.web_runner.cleanup()
         if self.status_runner:
             await self.status_runner.cleanup()
+        if self.vapi_runner:
+            await self.vapi_runner.cleanup()
         await super().close()
 
     # ---- Inbound: Twilio -> Discord ------------------------------------
@@ -495,6 +519,44 @@ class Bridge(discord.Client):
         print(json.dumps(data, indent=2, sort_keys=True), file=sys.stdout, flush=True)
         syslog.syslog(syslog.LOG_INFO, json.dumps(data, sort_keys=True, separators=(",", ":")))
         return web.Response(status=204)
+
+    # ---- Vapi status / server messages -----------------------------------
+    @staticmethod
+    def _check_vapi_hmac(request: web.Request, body: bytes) -> web.Response | None:
+        """Verify Vapi HMAC credential signature (sha256, hex, '{timestamp}.{body}').
+
+        Returns an error response, or None if OK.
+        """
+        if not VAPI_HMAC_PSK:
+            log.warning("Rejected Vapi request: VAPI_HMAC_PSK not configured")
+            return web.Response(status=503, text="webhook not configured")
+
+        signature = request.headers.get(VAPI_HMAC_SIGNATURE_HEADER, "").strip()
+        if "=" in signature[:8]:  # tolerate a "sha256=" style prefix
+            signature = signature.split("=", 1)[1]
+        timestamp = request.headers.get(VAPI_HMAC_TIMESTAMP_HEADER, "")
+        payload = f"{timestamp}.".encode() + body if timestamp else body
+        expected = hmac.new(VAPI_HMAC_PSK.encode(), payload, hashlib.sha256).hexdigest()
+        if not signature or not hmac.compare_digest(expected, signature.lower()):
+            log.warning("Rejected Vapi request with bad signature for %s", request.path_qs)
+            return web.Response(status=403, text="invalid signature")
+        return None
+
+    async def handle_vapi_status(self, request: web.Request) -> web.Response:
+        body = await request.read()
+        if (err := self._check_vapi_hmac(request, body)):
+            return err
+
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = {"raw": body.decode("utf-8", "replace")}
+        # Console: pretty-printed like `| jq`. Syslog: one compact line.
+        print(json.dumps(data, indent=2, sort_keys=True), file=sys.stdout, flush=True)
+        syslog.openlog("discord-sms-vapistatus", syslog.LOG_PID, syslog.LOG_USER)
+        syslog.syslog(syslog.LOG_INFO, json.dumps(data, sort_keys=True, separators=(",", ":")))
+        syslog.openlog("discord-sms-callstatus", syslog.LOG_PID, syslog.LOG_USER)
+        return web.json_response({})
 
     async def handle_twilio(self, request: web.Request) -> web.Response:
         form = await request.post()

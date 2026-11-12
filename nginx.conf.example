@@ -43,3 +43,22 @@ server {
         proxy_set_header   X-Forwarded-Proto $scheme;
     }
 }
+
+# Vapi server/status webhooks -> third listener (VAPI_STATUS_PORT, default 2326).
+# Set the Vapi Server URL to:
+#     https://status.vapi.crm.happytailspawcare.com/   (HMAC credential, VAPI_HMAC_PSK)
+server {
+    listen 443 ssl;
+    server_name status.vapi.crm.happytailspawcare.com;
+
+    ssl_certificate     /etc/letsencrypt/live/status.vapi.crm.happytailspawcare.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/status.vapi.crm.happytailspawcare.com/privkey.pem;
+
+    location / {
+        proxy_pass         http://127.0.0.1:2326;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}

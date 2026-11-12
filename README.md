@@ -112,6 +112,10 @@ sudo nginx -t && sudo systemctl reload nginx
 | `TWILIO_PUBLIC_URL`    | *(optional)* public https URL; enables signature validation. |
 | `TWILIO_STATUS_PORT`   | *(optional)* local port for call-status callbacks (default `2325`). |
 | `TWILIO_STATUS_PUBLIC_URL` | *(optional)* public URL Twilio signs status callbacks against (default `https://status.twilio.happytailspawcare.com`). |
+| `VAPI_HMAC_PSK`        | Secret key of the Vapi **HMAC** credential; required for the Vapi webhook (requests are rejected without it). |
+| `VAPI_STATUS_PORT`     | *(optional)* local port for Vapi webhooks (default `2326`). |
+| `VAPI_HMAC_SIGNATURE_HEADER` | *(optional)* signature header (default `x-signature`). |
+| `VAPI_HMAC_TIMESTAMP_HEADER` | *(optional)* timestamp header (default `x-timestamp`). |
 
 The bot requires the **Message Content** and **Server Members** privileged
 intents (enable them in the Discord Developer Portal).
@@ -162,4 +166,21 @@ Each report has its `X-Twilio-Signature` checked against
 
 ```bash
 journalctl -t discord-sms-callstatus -f
+```
+
+## Vapi status webhook
+
+A third receiver listens on `127.0.0.1:$VAPI_STATUS_PORT` (default `2326`)
+and accepts `POST` on any path. nginx serves it as
+`https://status.vapi.crm.happytailspawcare.com/` (see `vapi-status.conf`);
+use that as the assistant/phone number **Server URL** in Vapi.
+
+Create an **HMAC** credential in Vapi (algorithm SHA256, hex encoding, payload
+format `{timestamp}.{body}` — Vapi's defaults) with the same secret as
+`VAPI_HMAC_PSK`, and attach it to the server URL via `credentialId`. Each
+request's signature is checked, then the JSON body is printed to stdout and
+written to syslog tagged `discord-sms-vapistatus`:
+
+```bash
+journalctl -t discord-sms-vapistatus -f
 ```
